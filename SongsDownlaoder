@@ -1,0 +1,377 @@
+package com.example.songsdownloader;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.http.MediaType;
+import org.springframework.stereotype.Controller;
+import org.springframework.ui.Model;
+import org.springframework.util.StreamUtils;
+import org.springframework.web.bind.annotation.*;
+
+import javax.annotation.PreDestroy;
+import javax.servlet.http.HttpServletResponse;
+import java.io.*;
+import java.net.URI;
+import java.net.http.*;
+import java.nio.file.*;
+import java.time.Duration;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.stream.Collectors;
+
+/**
+ * Songs Downloader Application
+ * - Achieves faster downloads through multithreaded crawling.
+ * - Utilizes Java HttpClient for robust connections.
+ * - Provides a responsive UI.
+ *
+ * Single file Spring Boot Application.
+ */
+@SpringBootApplication
+public class SongsDownloaderApplication {
+
+    public static void main(String[] args) {
+        SpringApplication.run(SongsDownloaderApplication.class, args);
+    }
+
+    @Controller
+    public static class DownloadController {
+
+        private final ExecutorService executor = Executors.newFixedThreadPool(5);
+        private final HttpClient httpClient = HttpClient.newBuilder()
+                .connectTimeout(Duration.ofSeconds(10))
+                .followRedirects(HttpClient.Redirect.NORMAL)
+                .build();
+
+        // Store download statuses keyed by a unique downloadId
+        private final Map<String, DownloadStatus> downloadStatusMap = new ConcurrentHashMap<>();
+
+        // Endpoint to serve homepage UI
+        @GetMapping("/")
+        public String home() {
+            return "home";
+        }
+
+        // Model for download request
+        public static class DownloadRequest {
+            private String urls; // multiline URLs
+
+            public String getUrls() {
+                return urls;
+            }
+
+            public void setUrls(String urls) {
+                this.urls = urls;
+            }
+        }
+
+        // Start downloads, returns a downloadId to client to query progress
+        @PostMapping("/start-download")
+        @ResponseBody
+        public Map<String,String> startDownload(@RequestBody DownloadRequest request) {
+            String downloadId = UUID.randomUUID().toString();
+            List<String> urlList = Arrays.stream(Optional.ofNullable(request.getUrls()).orElse("")
+                    .split("\\r?\\n"))
+                    .filter(line -> !line.trim().isEmpty())
+                    .collect(Collectors.toList());
+
+            DownloadStatus status = new DownloadStatus(urlList);
+            downloadStatusMap.put(downloadId, status);
+
+            executor.submit(() -> performDownloads(downloadId, status));
+
+            return Map.of("downloadId", downloadId);
+        }
+
+        // Endpoint for UI to poll progress
+        @GetMapping("/progress/{downloadId}")
+        @ResponseBody
+        public DownloadStatus getProgress(@PathVariable String downloadId) {
+            return downloadStatusMap.getOrDefault(downloadId, new DownloadStatus(Collections.emptyList()));
+        }
+
+        // DownloadStatus class to track progress and results
+        public static class DownloadStatus {
+            private final List<String> urls;
+            private final Map<String, String> results = new ConcurrentHashMap<>();
+            private volatile int completedCount = 0;
+            private volatile int successCount = 0;
+
+            public DownloadStatus(List<String> urls) {
+                this.urls = urls;
+            }
+
+            public List<String> getUrls() {
+                return urls;
+            }
+
+            public Map<String, String> getResults() {
+                return results;
+            }
+
+            public int getCompletedCount() {
+                return completedCount;
+            }
+
+            public int getSuccessCount() {
+                return successCount;
+            }
+
+            public int getTotalCount() {
+                return urls.size();
+            }
+        }
+
+        // Method performing multithreaded downloads
+        private void performDownloads(String downloadId, DownloadStatus status) {
+            List<String> urls = status.getUrls();
+            List<Callable<Void>> tasks = new ArrayList<>();
+
+            // For speed, limiting concurrent downloads to thread pool size (5)
+            for (String url : urls) {
+                tasks.add(() -> {
+                    try {
+                        String fileName = extractFileName(url);
+                        if (fileName == null || fileName.isEmpty()) fileName = "song_" + UUID.randomUUID() + ".mp3";
+
+                        Path target = Paths.get("downloads").resolve(fileName);
+                        Files.createDirectories(target.getParent());
+                        HttpRequest request = HttpRequest.newBuilder()
+                                .uri(URI.create(url))
+                                .timeout(Duration.ofSeconds(20))
+                                .GET()
+                                .build();
+
+                        HttpResponse<Path> response = httpClient.send(request, HttpResponse.BodyHandlers.ofFile(target));
+
+                        if (response.statusCode() == 200 && Files.exists(target) && Files.size(target) > 0) {
+                            status.getResults().put(url, "Downloaded: " + target.getFileName());
+                            status.successCount++;
+                        } else {
+                            status.getResults().put(url, "Failed to download (status code: " + response.statusCode() + ")");
+                        }
+                    } catch (Exception e) {
+                        status.getResults().put(url, "Error: " + e.getMessage());
+                    } finally {
+                        status.completedCount++;
+                    }
+                    return null;
+                });
+            }
+
+            try {
+                // Invoke all tasks with a thread pool
+                executor.invokeAll(tasks);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+
+        // Extract filename from URL
+        private String extractFileName(String url) {
+            try {
+                URI uri = new URI(url);
+                String path = uri.getPath();
+                if (path == null || path.trim().isEmpty()) return null;
+                int lastSlash = path.lastIndexOf('/');
+                if (lastSlash >= 0 && lastSlash < path.length() - 1) {
+                    return path.substring(lastSlash + 1);
+                }
+            } catch (Exception ignored) {
+            }
+            return null;
+        }
+
+        // Serve static HTML UI via Spring MVC's model and thymeleaf-like rendering substitute
+        @GetMapping(value = "/home", produces = MediaType.TEXT_HTML_VALUE)
+        @ResponseBody
+        public String uiPage() {
+            return getHtmlPage();
+        }
+
+        // Redirect root (/) to UI page
+        @GetMapping(value = "/", produces = MediaType.TEXT_HTML_VALUE)
+        @ResponseBody
+        public String rootUiPage() {
+            return getHtmlPage();
+        }
+
+        // HTML page with inline JavaScript to interact with backend
+        private String getHtmlPage() {
+            return """
+                    <!DOCTYPE html>
+                    <html lang="en">
+                    <head>
+                        <meta charset="UTF-8" />
+                        <meta name="viewport" content="width=device-width, initial-scale=1" />
+                        <title>Songs Downloader</title>
+                        <style>
+                            body {
+                                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                                background: #121212;
+                                color: #eee;
+                                margin: 0; padding: 0;
+                                display: flex;
+                                flex-direction: column;
+                                min-height: 100vh;
+                                align-items: center;
+                                justify-content: flex-start;
+                                padding: 20px;
+                            }
+                            h1 {
+                                color: #1db954;
+                                margin-bottom: 0.2em;
+                            }
+                            textarea {
+                                width: 100%;
+                                max-width: 600px;
+                                height: 150px;
+                                border-radius: 8px;
+                                border: none;
+                                padding: 10px;
+                                font-size: 1em;
+                                resize: vertical;
+                                color: #121212;
+                            }
+                            button {
+                                background: #1db954;
+                                border: none;
+                                color: white;
+                                font-weight: bold;
+                                padding: 10px 25px;
+                                margin-top: 10px;
+                                cursor: pointer;
+                                border-radius: 25px;
+                                font-size: 1.1em;
+                                transition: background-color 0.3s ease;
+                            }
+                            button:hover {
+                                background: #14833b;
+                            }
+                            .progress {
+                                margin-top: 20px;
+                                width: 100%;
+                                max-width: 600px;
+                            }
+                            .result {
+                                margin-top: 20px;
+                                background: #222;
+                                padding: 15px;
+                                border-radius: 8px;
+                                max-height: 300px;
+                                overflow-y: auto;
+                                font-family: monospace;
+                                font-size: 0.9em;
+                            }
+                        </style>
+                    </head>
+                    <body>
+                        <h1>Songs Downloader</h1>
+                        <p>Enter one or more song URLs (one per line) to download them concurrently.</p>
+                        <textarea id="urls" placeholder="https://example.com/song1.mp3\nhttps://example.com/song2.mp3"></textarea>
+                        <button id="downloadBtn">Start Download</button>
+                        
+                        <div class="progress" id="progress" style="display:none;">
+                            <strong>Download Progress:</strong>
+                            <p id="progressText">0 / 0</p>
+                            <div style="background:#444; border-radius: 10px; height: 20px; overflow: hidden;">
+                                <div id="progressBar" style="background:#1db954; height: 100%; width: 0%; transition: width 0.3s;"></div>
+                            </div>
+                        </div>
+                        <div class="result" id="result" style="display:none;"></div>
+
+                        <script>
+                            const downloadBtn = document.getElementById('downloadBtn');
+                            const urlsInput = document.getElementById('urls');
+                            const progressDiv = document.getElementById('progress');
+                            const progressText = document.getElementById('progressText');
+                            const progressBar = document.getElementById('progressBar');
+                            const resultDiv = document.getElementById('result');
+
+                            let downloadId = null;
+                            let progressInterval = null;
+
+                            downloadBtn.addEventListener('click', () => {
+                                let urls = urlsInput.value.trim();
+                                if (!urls) {
+                                    alert('Please enter at least one song URL.');
+                                    return;
+                                }
+                                startDownload(urls);
+                            });
+
+                            function startDownload(urls) {
+                                resultDiv.style.display = 'none';
+                                progressDiv.style.display = 'block';
+                                progressText.textContent = 'Preparing...';
+                                progressBar.style.width = '0%';
+                                downloadBtn.disabled = true;
+
+                                fetch('/start-download', {
+                                    method: 'POST',
+                                    headers: {
+                                        'Content-Type': 'application/json'
+                                    },
+                                    body: JSON.stringify({urls: urls})
+                                }).then(res => res.json())
+                                  .then(data => {
+                                      downloadId = data.downloadId;
+                                      pollProgress();
+                                      progressInterval = setInterval(pollProgress, 2000);
+                                  }).catch(err => {
+                                      alert('Error starting download: ' + err);
+                                      downloadBtn.disabled = false;
+                                      progressDiv.style.display = 'none';
+                                  });
+                            }
+
+                            function pollProgress() {
+                                if (!downloadId) return;
+
+                                fetch('/progress/' + downloadId)
+                                    .then(res => res.json())
+                                    .then(data => {
+                                        const total = data.totalCount || 0;
+                                        const completed = data.completedCount || 0;
+                                        progressText.textContent = completed + ' / ' + total;
+                                        let percent = total > 0 ? (completed * 100 / total) : 0;
+                                        progressBar.style.width = percent + '%';
+
+                                        if (completed >= total) {
+                                            clearInterval(progressInterval);
+                                            downloadId = null;
+                                            showResults(data.results);
+                                            downloadBtn.disabled = false;
+                                        }
+                                    })
+                                    .catch(err => {
+                                        clearInterval(progressInterval);
+                                        downloadId = null;
+                                        alert('Error polling progress: ' + err);
+                                        downloadBtn.disabled = false;
+                                        progressDiv.style.display = 'none';
+                                    });
+                            }
+
+                            function showResults(results) {
+                                progressDiv.style.display = 'none';
+                                resultDiv.style.display = 'block';
+                                let html = '';
+                                for (let [url, status] of Object.entries(results)) {
+                                    html += `<div><b>${url}</b>: ${status}</div>`;
+                                }
+                                resultDiv.innerHTML = html;
+                            }
+                        </script>
+                    </body>
+                    </html>
+                    """;
+        }
+
+        @PreDestroy
+        public void shutdownExecutor() {
+            executor.shutdown();
+        }
+    }
+}
+
